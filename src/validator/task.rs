@@ -998,6 +998,9 @@ async fn sync_blocks(
     if missing_blocks.is_empty() {
         return Ok(());
     }
+
+    let missing_blocks_len = missing_blocks.len();
+    tracing::info!("Syncing {missing_blocks_len} missing blocks from `{main_tip}`",);
     for missing_block in missing_blocks.into_iter().rev() {
         tracing::debug!("Syncing block `{missing_block}` -> `{main_tip}`");
         let block = main_client
@@ -1014,6 +1017,8 @@ async fn sync_blocks(
         tracing::debug!("connected block at height {height}: {missing_block}");
         let () = rwtxn.commit()?;
     }
+
+    tracing::info!("Synced {missing_blocks_len} missing blocks");
     Ok(())
 }
 
@@ -1068,12 +1073,25 @@ pub(super) async fn task(
         .try_for_each(|msg| async move {
             match msg {
                 SequenceMessage::BlockHashConnected(block_hash, _) => {
+                    let tip_height = main_client
+                        .get_block(block_hash, U8Witness::<1>)
+                        .await
+                        .map(|block| block.height )
+                        .map_err(|err| {
+                            let rpc_error = SyncError::JsonRpc {
+                                method: "getblock".to_owned(),
+                                source: err,
+                            };
+                            ErrorInner::Sync(rpc_error.split().unwrap_err())
+                        })?;
+
                     let () = sync_to_tip(dbs, event_tx, main_client, block_hash)
                         .await
                         .or_else(|err| {
-                            let non_fatal: <SyncError as fatality::Split>::Jfyi = err.split()?;
-                            let non_fatal = anyhow::Error::from(non_fatal);
-                            tracing::warn!("Error during sync to {block_hash}: {non_fatal:#}");
+                            let non_fatal = err.split()?;
+                            tracing::warn!(
+                                "Error during sync to {block_hash} (height: {tip_height}): {non_fatal:?}"
+                            );
                             Ok::<(), ErrorInner>(())
                         })?;
                     Ok(())
