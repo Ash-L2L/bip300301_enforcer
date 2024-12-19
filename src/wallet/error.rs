@@ -38,3 +38,53 @@ pub struct BitcoinCoreRPC {
 #[error("failed to consensus encode block")]
 #[diagnostic(code(encode_block_error))]
 pub struct EncodeBlock(#[from] pub bitcoin::io::Error);
+
+#[derive(Debug, Diagnostic, Error)]
+pub(in crate::wallet) enum GetBundleProposals {
+    #[error(transparent)]
+    BlindedM6(#[from] crate::types::BlindedM6Error),
+    #[error(transparent)]
+    ConsensusEncoding(#[from] bitcoin::consensus::encode::Error),
+    #[error(transparent)]
+    GetPendingWithdrawals(#[from] crate::validator::GetPendingWithdrawalsError),
+    #[error(transparent)]
+    Rustqlite(#[from] rusqlite::Error),
+}
+
+#[derive(Debug, Diagnostic, Error)]
+pub(in crate::wallet) enum GenerateCoinbaseTxouts {
+    #[error(transparent)]
+    CoinbaseMessages(#[from] crate::messages::CoinbaseMessagesError),
+    #[error(transparent)]
+    GetBundleProposals(#[from] crate::wallet::error::GetBundleProposals),
+    #[error(transparent)]
+    GetPendingWithdrawals(#[from] crate::validator::GetPendingWithdrawalsError),
+    #[error(transparent)]
+    GetSidechains(#[from] crate::validator::GetSidechainsError),
+    #[error(transparent)]
+    PushBytes(#[from] bitcoin::script::PushBytesError),
+    #[error(transparent)]
+    Rustqlite(#[from] rusqlite::Error),
+}
+
+#[derive(Debug, Diagnostic, Error)]
+pub(in crate::wallet) enum InitialBlockTemplateInner {
+    #[error(transparent)]
+    GetMainchainTip(#[from] crate::validator::GetMainchainTipError),
+    #[error(transparent)]
+    GenerateCoinbaseTxouts(#[from] GenerateCoinbaseTxouts),
+}
+
+#[derive(Debug, Diagnostic, Error)]
+#[error(transparent)]
+#[repr(transparent)]
+pub struct InitialBlockTemplate(InitialBlockTemplateInner);
+
+impl<Err> From<Err> for InitialBlockTemplate
+where
+    InitialBlockTemplateInner: From<Err>,
+{
+    fn from(err: Err) -> Self {
+        Self(err.into())
+    }
+}

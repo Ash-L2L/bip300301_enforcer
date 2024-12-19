@@ -159,6 +159,7 @@ impl BlockHashDbs {
     }
 
     /// Check if the database contains the provided header
+    #[allow(dead_code)]
     pub fn contains_header(
         &self,
         rotxn: &RoTxn,

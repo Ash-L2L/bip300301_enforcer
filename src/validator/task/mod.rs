@@ -10,6 +10,7 @@ use bitcoin::{
     hashes::{sha256d, Hash as _},
     Amount, Block, BlockHash, OutPoint, Transaction, Work,
 };
+use cusf_enforcer_mempool::zmq::{BlockHashMessage, SequenceMessage};
 use either::Either;
 use fallible_iterator::FallibleIterator;
 use fatality::Split as _;
@@ -29,10 +30,9 @@ use crate::{
         WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD, WITHDRAWAL_BUNDLE_MAX_AGE,
     },
     validator::dbs::{db_error, Dbs, RwTxn, UnitKey},
-    zmq::SequenceMessage,
 };
 
-mod error;
+pub mod error;
 
 const USED_SIDECHAIN_SLOT_PROPOSAL_MAX_AGE: u16 = 10;
 const USED_SIDECHAIN_SLOT_ACTIVATION_THRESHOLD: u16 = USED_SIDECHAIN_SLOT_PROPOSAL_MAX_AGE / 2;
@@ -544,7 +544,7 @@ fn handle_transaction(
     accepted_bmm_requests: &mut BmmCommitments,
     prev_mainchain_block_hash: &BlockHash,
     transaction: &Transaction,
-) -> Result<Option<TransactionEvent>, error::ConnectBlock> {
+) -> Result<Option<TransactionEvent>, error::HandleTransaction> {
     let mut res = None;
     match handle_m5_m6(rwtxn, dbs, Cow::Borrowed(transaction))? {
         Some(Either::Left(deposit)) => {
@@ -568,15 +568,12 @@ fn handle_transaction(
         accepted_bmm_requests,
         prev_mainchain_block_hash,
     )
-    // We need to differentiate fatal and non-fatal errors. Non-fatal
-    // errors should not cause the initial sync to exit! We therefore must take
-    // care to not use the ? operator to exit from connect_block with an error
-    .or_else(|err| match err.split() {
+    .map_err(|err| match err.split() {
         Ok(just_for_info) => {
             tracing::warn!("Non-fatal error handling M8: {just_for_info:#}");
-            Ok(false)
+            error::HandleTransaction::M8(just_for_info.into())
         }
-        Err(err) => Err(error::ConnectBlock::M8(err.into())),
+        Err(err) => error::HandleTransaction::M8(err.into()),
     })? {
         tracing::trace!(
             "Handled valid M8 BMM request in tx `{}`",
@@ -586,13 +583,49 @@ fn handle_transaction(
     Ok(res)
 }
 
-fn connect_block(
+/// Check if a tx is valid against the current tip.
+pub fn validate_tx(
+    dbs: &Dbs,
+    transaction: &Transaction,
+) -> Result<bool, error::ValidateTransaction> {
+    let mut rwtxn = dbs.write_txn()?;
+    let tip_hash = dbs
+        .current_chain_tip
+        .try_get(&rwtxn, &UnitKey)?
+        .ok_or(error::ValidateTransactionInner::NoChainTip)?;
+    match handle_transaction(
+        &mut rwtxn,
+        dbs,
+        &mut BmmCommitments::new(),
+        &tip_hash,
+        transaction,
+    ) {
+        Ok(_) => Ok(true),
+        Err(err) => match err.split() {
+            Ok(_jfyi) => Ok(false),
+            Err(err) => Err(err.into()),
+        },
+    }
+}
+
+pub(in crate::validator) fn connect_block(
     rwtxn: &mut RwTxn,
     dbs: &Dbs,
     event_tx: &Sender<Event>,
     block: &Block,
-    height: u32,
 ) -> Result<(), error::ConnectBlock> {
+    let parent = block.header.prev_blockhash;
+    let height = match dbs.current_chain_tip.try_get(rwtxn, &UnitKey)? {
+        Some(tip) if parent == tip => dbs.block_hashes.height().get(rwtxn, &tip)? + 1,
+        Some(tip) => return Err(error::ConnectBlock::BlockParent { parent, tip }),
+        None if block.header.prev_blockhash == BlockHash::all_zeros() => 0,
+        None => {
+            return Err(error::ConnectBlock::BlockParent {
+                parent,
+                tip: BlockHash::all_zeros(),
+            })
+        }
+    };
     let coinbase = &block.txdata[0];
     let mut coinbase_messages = CoinbaseMessages::new();
     // map of sidechain proposals to first vout
@@ -728,7 +761,7 @@ fn connect_block(
 // TODO: Add unit tests ensuring that `connect_block` and `disconnect_block` are inverse
 // operations.
 #[allow(unreachable_code, unused_variables)]
-fn disconnect_block(
+pub(in crate::validator) fn disconnect_block(
     _rwtxn: &mut RwTxn,
     _dbs: &Dbs,
     event_tx: &Sender<Event>,
@@ -749,11 +782,14 @@ fn _is_transaction_valid(
     todo!();
 }
 
-async fn sync_headers(
+async fn sync_headers<MainClient>(
     dbs: &Dbs,
-    main_client: &jsonrpsee::http_client::HttpClient,
+    main_client: &MainClient,
     main_tip: BlockHash,
-) -> Result<(), error::Sync> {
+) -> Result<(), error::Sync>
+where
+    MainClient: bip300301::client::MainClient + Sync,
+{
     let mut block_hash = main_tip;
     while let Some((latest_missing_header, latest_missing_header_height)) =
         tokio::task::block_in_place(|| {
@@ -797,13 +833,16 @@ async fn sync_headers(
     Ok(())
 }
 
-// MUST be called after `initial_sync_headers`.
-async fn sync_blocks(
+// MUST be called after `sync_headers`.
+async fn sync_blocks<MainClient>(
     dbs: &Dbs,
     event_tx: &Sender<Event>,
-    main_client: &jsonrpsee::http_client::HttpClient,
+    main_client: &MainClient,
     main_tip: BlockHash,
-) -> Result<(), error::Sync> {
+) -> Result<(), error::Sync>
+where
+    MainClient: bip300301::client::MainClient + Sync,
+{
     let missing_blocks: Vec<BlockHash> = tokio::task::block_in_place(|| {
         let rotxn = dbs.read_txn()?;
         dbs.block_hashes
@@ -828,19 +867,23 @@ async fn sync_blocks(
             .0;
         let mut rwtxn = dbs.write_txn()?;
         let height = dbs.block_hashes.height().get(&rwtxn, &missing_block)?;
-        let () = connect_block(&mut rwtxn, dbs, event_tx, &block, height)?;
+        // FIXME: handle disconnects
+        let () = connect_block(&mut rwtxn, dbs, event_tx, &block)?;
         tracing::debug!("connected block at height {height}: {missing_block}");
         let () = rwtxn.commit()?;
     }
     Ok(())
 }
 
-async fn sync_to_tip(
+pub(in crate::validator) async fn sync_to_tip<MainClient>(
     dbs: &Dbs,
     event_tx: &Sender<Event>,
-    main_client: &jsonrpsee::http_client::HttpClient,
+    main_client: &MainClient,
     main_tip: BlockHash,
-) -> Result<(), error::Sync> {
+) -> Result<(), error::Sync>
+where
+    MainClient: bip300301::client::MainClient + Sync,
+{
     let () = sync_headers(dbs, main_client, main_tip).await?;
     let () = sync_blocks(dbs, event_tx, main_client, main_tip).await?;
     Ok(())
@@ -869,7 +912,7 @@ pub(super) async fn task(
     dbs: &Dbs,
     event_tx: &Sender<Event>,
 ) -> Result<(), error::Fatal> {
-    let zmq_sequence = crate::zmq::subscribe_sequence(zmq_addr_sequence)
+    let zmq_sequence = cusf_enforcer_mempool::zmq::subscribe_sequence(zmq_addr_sequence)
         .await
         .map_err(error::Fatal::from)?;
     let () = initial_sync(dbs, event_tx, main_client)
@@ -886,8 +929,14 @@ pub(super) async fn task(
     zmq_sequence
         .err_into::<error::Fatal>()
         .try_for_each(|msg| async move {
-            match msg {
-                SequenceMessage::BlockHashConnected(block_hash, _) => {
+            let BlockHashMessage {
+                block_hash, event, ..
+            } = match msg {
+                SequenceMessage::BlockHash(block_hash_msg) => block_hash_msg,
+                SequenceMessage::TxHash(_) => return Ok(()),
+            };
+            match event {
+                cusf_enforcer_mempool::zmq::BlockHashEvent::Connected => {
                     let () = sync_to_tip(dbs, event_tx, main_client, block_hash)
                         .await
                         .or_else(|err| {
@@ -898,12 +947,9 @@ pub(super) async fn task(
                         })?;
                     Ok(())
                 }
-                SequenceMessage::BlockHashDisconnected(block_hash, _) => {
+                cusf_enforcer_mempool::zmq::BlockHashEvent::Disconnected => {
                     let mut rwtxn = dbs.write_txn()?;
                     let () = disconnect_block(&mut rwtxn, dbs, event_tx, block_hash)?;
-                    Ok(())
-                }
-                SequenceMessage::TxHashAdded { .. } | SequenceMessage::TxHashRemoved { .. } => {
                     Ok(())
                 }
             }

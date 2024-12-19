@@ -272,7 +272,7 @@ impl<KC, DC> RoDatabase<KC, DC> {
         }
     }
 
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, dead_code)]
     pub fn first<'txn>(
         &self,
         rotxn: &'txn RoTxn<'_>,

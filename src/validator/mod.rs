@@ -1,9 +1,10 @@
 use std::{future::Future, path::Path, sync::Arc};
 
-use async_broadcast::{broadcast, InactiveReceiver};
+use async_broadcast::{broadcast, InactiveReceiver, Sender};
 use bip300301::{jsonrpsee, MainClient};
-use bitcoin::{self, Amount, BlockHash, OutPoint};
+use bitcoin::{self, Amount, BlockHash, OutPoint, Transaction};
 use fallible_iterator::FallibleIterator;
+use fatality::Nested as _;
 use futures::{stream::FusedStream, FutureExt as _, StreamExt, TryFutureExt as _};
 use miette::{Diagnostic, IntoDiagnostic};
 use thiserror::Error;
@@ -17,7 +18,8 @@ use crate::types::{
 mod dbs;
 mod task;
 
-use dbs::{CreateDbsError, Dbs, PendingM6ids};
+use dbs::{db_error, CreateDbsError, Dbs, PendingM6ids};
+pub use task::error::ValidateTransaction as ValidateTransactionError;
 
 #[derive(Debug, Error)]
 pub enum InitError {
@@ -60,7 +62,7 @@ enum GetHeaderInfoErrorInner {
     GetHeaderInfo(#[from] dbs::block_hash_dbs_error::GetHeaderInfo),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Diagnostic, Error)]
 #[error(transparent)]
 #[repr(transparent)]
 pub struct GetHeaderInfoError(GetHeaderInfoErrorInner);
@@ -96,6 +98,14 @@ where
     }
 }
 
+#[derive(Debug, Diagnostic, Error)]
+pub enum GetMainchainTipError {
+    #[error(transparent)]
+    ReadTxn(#[from] dbs::ReadTxnError),
+    #[error(transparent)]
+    DbGet(#[from] dbs::db_error::Get),
+}
+
 #[derive(Debug, Error)]
 pub enum TryGetBmmCommitmentsError {
     #[error(transparent)]
@@ -105,16 +115,34 @@ pub enum TryGetBmmCommitmentsError {
 }
 
 #[derive(Debug, Diagnostic, Error)]
+pub enum GetPendingWithdrawalsError {
+    #[error(transparent)]
+    ReadTxn(#[from] dbs::ReadTxnError),
+    #[error(transparent)]
+    DbGet(#[from] dbs::db_error::Get),
+}
+
+#[derive(Debug, Diagnostic, Error)]
 pub enum EventsStreamError {
     #[error("Events stream closed due to overflow")]
     Overflow,
 }
 
+#[derive(Debug, Diagnostic, Error)]
+pub enum GetSidechainsError {
+    #[error(transparent)]
+    DbIter(#[from] db_error::Iter),
+    #[error(transparent)]
+    ReadTxn(#[from] dbs::ReadTxnError),
+}
+
 #[derive(Clone)]
 pub struct Validator {
     dbs: Dbs,
-    network: bitcoin::Network,
     events_rx: InactiveReceiver<Event>,
+    events_tx: Sender<Event>,
+    mainchain_client: jsonrpsee::http_client::HttpClient,
+    network: bitcoin::Network,
     task: Arc<JoinHandle<()>>,
 }
 
@@ -143,6 +171,8 @@ impl Validator {
         let dbs = Dbs::new(data_dir, blockchain_info.chain)?;
         let task = spawn({
             let dbs = dbs.clone();
+            let events_tx = events_tx.clone();
+            let mainchain_client = mainchain_client.clone();
             async move {
                 task::task(&mainchain_client, &zmq_addr_sequence, &dbs, &events_tx)
                     .then(|res| async {
@@ -157,6 +187,8 @@ impl Validator {
         Ok(Self {
             dbs,
             events_rx: events_rx.deactivate(),
+            events_tx,
+            mainchain_client,
             network: blockchain_info.chain,
             task: Arc::new(task),
         })
@@ -178,32 +210,34 @@ impl Validator {
     }
 
     /// Get (possibly unactivated) sidechains
-    pub fn get_sidechains(&self) -> Result<Vec<(SidechainProposalId, Sidechain)>, miette::Report> {
-        let rotxn = self.dbs.read_txn().into_diagnostic()?;
+    pub fn get_sidechains(
+        &self,
+    ) -> Result<Vec<(SidechainProposalId, Sidechain)>, GetSidechainsError> {
+        let rotxn = self.dbs.read_txn()?;
         let res = self
             .dbs
             .proposal_id_to_sidechain
             .iter(&rotxn)
-            .into_diagnostic()?
+            .map_err(db_error::Iter::from)?
             .collect()
-            .into_diagnostic()?;
+            .map_err(db_error::Iter::from)?;
         Ok(res)
     }
 
-    pub fn get_active_sidechains(&self) -> Result<Vec<Sidechain>, miette::Report> {
-        let rotxn = self.dbs.read_txn().into_diagnostic()?;
+    pub fn get_active_sidechains(&self) -> Result<Vec<Sidechain>, GetSidechainsError> {
+        let rotxn = self.dbs.read_txn()?;
         let res = self
             .dbs
             .active_sidechains
             .sidechain()
             .iter(&rotxn)
-            .into_diagnostic()?
+            .map_err(db_error::Iter::from)?
             .map(|(_sidechain_number, sidechain)| {
                 assert!(sidechain.status.activation_height.is_some());
                 Ok(sidechain)
             })
             .collect()
-            .into_diagnostic()?;
+            .map_err(db_error::Iter::from)?;
         Ok(res)
     }
 
@@ -292,12 +326,10 @@ impl Validator {
     }
 
     /// Get the mainchain tip. Returns an error if not synced
-    pub fn get_mainchain_tip(&self) -> Result<BlockHash, miette::Report> {
-        let txn = self.dbs.read_txn().into_diagnostic()?;
-        self.dbs
-            .current_chain_tip
-            .get(&txn, &dbs::UnitKey)
-            .into_diagnostic()
+    pub fn get_mainchain_tip(&self) -> Result<BlockHash, GetMainchainTipError> {
+        let txn = self.dbs.read_txn()?;
+        let res = self.dbs.current_chain_tip.get(&txn, &dbs::UnitKey)?;
+        Ok(res)
     }
 
     pub fn get_two_way_peg_data(
@@ -329,13 +361,14 @@ impl Validator {
     pub fn get_pending_withdrawals(
         &self,
         sidechain_number: &SidechainNumber,
-    ) -> Result<PendingM6ids, miette::Report> {
-        let rotxn = self.dbs.read_txn().into_diagnostic()?;
-        self.dbs
+    ) -> Result<PendingM6ids, GetPendingWithdrawalsError> {
+        let rotxn = self.dbs.read_txn()?;
+        let res = self
+            .dbs
             .active_sidechains
             .pending_m6ids()
-            .get(&rotxn, sidechain_number)
-            .into_diagnostic()
+            .get(&rotxn, sidechain_number)?;
+        Ok(res)
     }
 
     /*
@@ -393,5 +426,120 @@ impl Validator {
 impl Drop for Validator {
     fn drop(&mut self) {
         self.task.abort()
+    }
+}
+
+#[derive(Debug, Diagnostic, Error)]
+#[error(transparent)]
+#[repr(transparent)]
+pub struct SyncError(#[from] task::error::Sync);
+
+#[derive(Debug, Diagnostic, Error)]
+enum ConnectBlockErrorInner {
+    #[error(transparent)]
+    CommitWriteTxn(#[from] dbs::CommitWriteTxnError),
+    #[error(transparent)]
+    ConnectBlock(#[from] <task::error::ConnectBlock as fatality::Split>::Fatal),
+    #[error(transparent)]
+    WriteTxn(#[from] dbs::WriteTxnError),
+}
+
+#[derive(Debug, Diagnostic, Error)]
+#[error(transparent)]
+#[repr(transparent)]
+pub struct ConnectBlockError(ConnectBlockErrorInner);
+
+impl<Err> From<Err> for ConnectBlockError
+where
+    ConnectBlockErrorInner: From<Err>,
+{
+    fn from(err: Err) -> Self {
+        Self(err.into())
+    }
+}
+
+#[derive(Debug, Diagnostic, Error)]
+enum DisconnectBlockErrorInner {
+    #[error(transparent)]
+    CommitWriteTxn(#[from] dbs::CommitWriteTxnError),
+    #[error(transparent)]
+    DisconnectBlock(#[from] task::error::DisconnectBlock),
+    #[error(transparent)]
+    WriteTxn(#[from] dbs::WriteTxnError),
+}
+
+#[derive(Debug, Diagnostic, Error)]
+#[error(transparent)]
+#[repr(transparent)]
+pub struct DisconnectBlockError(DisconnectBlockErrorInner);
+
+impl<Err> From<Err> for DisconnectBlockError
+where
+    DisconnectBlockErrorInner: From<Err>,
+{
+    fn from(err: Err) -> Self {
+        Self(err.into())
+    }
+}
+
+impl cusf_enforcer_mempool::cusf_enforcer::CusfEnforcer for Validator {
+    type SyncError = SyncError;
+
+    async fn sync_to_tip(&mut self, tip: BlockHash) -> Result<(), Self::SyncError> {
+        task::sync_to_tip(&self.dbs, &self.events_tx, &self.mainchain_client, tip)
+            .map_err(SyncError)
+            .await
+    }
+
+    type ConnectBlockError = ConnectBlockError;
+
+    fn connect_block(
+        &mut self,
+        block: &bitcoin::Block,
+    ) -> Result<cusf_enforcer_mempool::cusf_enforcer::ConnectBlockAction, Self::ConnectBlockError>
+    {
+        let mut rwtxn = self.dbs.write_txn()?;
+        match task::connect_block(&mut rwtxn, &self.dbs, &self.events_tx, block).into_nested()? {
+            Ok(()) => {
+                rwtxn.commit()?;
+                Ok(
+                    cusf_enforcer_mempool::cusf_enforcer::ConnectBlockAction::Accept {
+                        // FIXME: implement
+                        remove_mempool_txs: todo!(),
+                    },
+                )
+            }
+            Err(jfyi) => {
+                let block_hash = block.block_hash();
+                tracing::info!(%block_hash, "rejecting block: {jfyi:#}");
+                Ok(cusf_enforcer_mempool::cusf_enforcer::ConnectBlockAction::Reject)
+            }
+        }
+    }
+
+    type DisconnectBlockError = DisconnectBlockError;
+
+    fn disconnect_block(
+        &mut self,
+        block_hash: BlockHash,
+    ) -> std::result::Result<(), Self::DisconnectBlockError> {
+        let mut rwtxn = self.dbs.write_txn()?;
+        let () = task::disconnect_block(&mut rwtxn, &self.dbs, &self.events_tx, block_hash)?;
+        rwtxn.commit()?;
+        Ok(())
+    }
+
+    type AcceptTxError = ValidateTransactionError;
+
+    fn accept_tx<TxRef>(
+        &mut self,
+        tx: &Transaction,
+        _tx_inputs: &std::collections::HashMap<bitcoin::Txid, TxRef>,
+    ) -> std::result::Result<bool, Self::AcceptTxError>
+    where
+        TxRef: std::borrow::Borrow<Transaction>,
+    {
+        let res = task::validate_tx(&self.dbs, tx)?;
+        Ok(res)
     }
 }

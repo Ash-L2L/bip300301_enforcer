@@ -371,7 +371,10 @@ impl ValidatorService for Validator {
             .into_diagnostic()
             .map_err(|err| err.into_status())?
             .height;
-        let sidechain_proposals = self.get_sidechains().map_err(|err| err.into_status())?;
+        let sidechain_proposals = self
+            .get_sidechains()
+            .into_diagnostic()
+            .map_err(|err| err.into_status())?;
         let sidechain_proposals = sidechain_proposals
             .into_iter()
             .map(|(proposal_id, sidechain)| {
@@ -406,6 +409,7 @@ impl ValidatorService for Validator {
         let GetSidechainsRequest {} = request.into_inner();
         let sidechains = self
             .get_active_sidechains()
+            .into_diagnostic()
             .map_err(|err| err.into_status())?;
         let sidechains = sidechains.into_iter().map(SidechainInfo::from).collect();
         let response = GetSidechainsResponse { sidechains };
