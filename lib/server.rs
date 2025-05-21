@@ -18,7 +18,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     convert,
-    display::ErrorChain,
+    errors::ErrorChain,
     messages::{
         parse_op_drivechain, CoinbaseMessage, M1ProposeSidechain, M2AckSidechain, M3ProposeBundle,
     },

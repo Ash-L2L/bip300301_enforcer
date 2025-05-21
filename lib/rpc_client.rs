@@ -4,7 +4,7 @@ use bip300301::{
 };
 use miette::miette;
 
-use crate::{cli::NodeRpcConfig, display::ErrorChain};
+use crate::{cli::NodeRpcConfig, errors::ErrorChain};
 
 pub fn create_client(
     conf: &NodeRpcConfig,
