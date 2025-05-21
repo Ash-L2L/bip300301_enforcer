@@ -57,6 +57,16 @@ pub mod error {
     }
 
     #[derive(Debug, Error)]
+    pub(crate) enum LastCommonAncestor {
+        #[error(transparent)]
+        DbGet(#[from] db_error::Get),
+        #[error(transparent)]
+        DbTryGet(#[from] db_error::TryGet),
+        #[error("missing or incorrect ancestor/height data for {0}")]
+        MissingData(BlockHash),
+    }
+
+    #[derive(Debug, Error)]
     pub(crate) enum TryGetHeaderInfo {
         #[error(transparent)]
         DbTryGet(#[from] db_error::TryGet),
@@ -184,6 +194,7 @@ impl BlockHashDbs {
     }
 
     /// Check if the database contains the provided block
+    #[allow(dead_code)]
     pub fn contains_block(
         &self,
         rotxn: &RoTxn,
@@ -278,6 +289,60 @@ impl BlockHashDbs {
                 Ok(None)
             }
         })
+    }
+
+    /// Find the last common ancestor of two blocks,
+    /// if headers for both exist
+    pub fn last_common_ancestor(
+        &self,
+        rotxn: &RoTxn,
+        block_hash0: BlockHash,
+        block_hash1: BlockHash,
+    ) -> Result<BlockHash, error::LastCommonAncestor> {
+        use std::cmp::Ordering;
+        // if the block hashes are the same, return early
+        if block_hash0 == block_hash1 {
+            return Ok(block_hash0);
+        }
+        if block_hash0 == BlockHash::all_zeros() || block_hash1 == BlockHash::all_zeros() {
+            return Ok(BlockHash::all_zeros());
+        }
+        let height0 = self.height.get(rotxn, &block_hash0)?;
+        let height1 = self.height.get(rotxn, &block_hash1)?;
+        let mut ancestors0 = self.ancestor_headers(rotxn, block_hash0);
+        let mut ancestors1 = self.ancestor_headers(rotxn, block_hash1);
+        // Equalize heights to min(height0, height1)
+        match height0.cmp(&height1) {
+            Ordering::Equal => (),
+            Ordering::Less => {
+                for _ in 0..height1 - height0 {
+                    if ancestors1.next()?.is_none() {
+                        return Err(error::LastCommonAncestor::MissingData(block_hash1));
+                    };
+                }
+            }
+            Ordering::Greater => {
+                for _ in 0..height0 - height1 {
+                    if ancestors0.next()?.is_none() {
+                        return Err(error::LastCommonAncestor::MissingData(block_hash0));
+                    };
+                }
+            }
+        }
+        for _ in 0..=std::cmp::min(height0, height1) {
+            let ancestor0 = ancestors0
+                .next()?
+                .ok_or_else(|| error::LastCommonAncestor::MissingData(block_hash0))?
+                .0;
+            let ancestor1 = ancestors1
+                .next()?
+                .ok_or_else(|| error::LastCommonAncestor::MissingData(block_hash1))?
+                .0;
+            if ancestor0 == ancestor1 {
+                return Ok(ancestor0);
+            }
+        }
+        Ok(BlockHash::all_zeros())
     }
 
     pub fn try_get_header_info(
