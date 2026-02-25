@@ -537,6 +537,18 @@ pub struct Bitcoind {
 }
 
 impl Bitcoind {
+    pub fn new_bitcoin_cli(&self, path: PathBuf) -> bip300301_enforcer_lib::bins::BitcoinCli {
+        bip300301_enforcer_lib::bins::BitcoinCli {
+            path,
+            network: self.network,
+            rpc_user: self.rpc_user.clone(),
+            rpc_pass: self.rpc_pass.clone(),
+            rpc_port: self.rpc_port,
+            rpc_host: self.rpc_host.clone(),
+            rpc_wallet: None,
+        }
+    }
+
     #[must_use]
     pub fn spawn_command_with_args<Env, Arg, Envs, Args, F>(
         &self,
@@ -652,6 +664,7 @@ pub struct Enforcer {
     pub node_rpc_pass: String,
     pub node_rpc_port: u16,
     pub node_zmq_sequence_port: u16,
+    pub p2p_broadcast_peer_ports: Vec<u16>,
     pub serve_grpc_port: u16,
     pub serve_json_rpc_port: u16,
     pub serve_rpc_port: u16,
@@ -691,6 +704,12 @@ impl Enforcer {
         if let Some(node_blocks_dir) = &self.node_blocks_dir {
             default_args.push(format!("--node-blocks-dir={}", node_blocks_dir.display()));
         }
+
+        default_args.extend(
+            self.p2p_broadcast_peer_ports
+                .iter()
+                .map(|peer_port| format!("--p2p-broadcast-addr=127.0.0.1:{peer_port}")),
+        );
 
         if self.enable_wallet {
             default_args.extend(vec![

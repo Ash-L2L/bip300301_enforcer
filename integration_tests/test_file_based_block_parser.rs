@@ -9,7 +9,7 @@ use tokio::time::sleep;
 use tonic::Code;
 
 use crate::{
-    setup::{PreSetup, new_bitcoin_cli, new_bitcoind, wait_for_port},
+    setup::{PreSetup, new_bitcoind, wait_for_port},
     util::Enforcer,
 };
 
@@ -36,7 +36,7 @@ pub async fn test_file_based_block_parser(setup: PreSetup) -> anyhow::Result<()>
     // wait for startup
     sleep(std::time::Duration::from_secs(1)).await;
 
-    let bitcoin_cli = new_bitcoin_cli(&bitcoind, setup.bin_paths.bitcoin_cli.clone());
+    let bitcoin_cli = bitcoind.new_bitcoin_cli(setup.bin_paths.bitcoin_cli.clone());
 
     tracing::info!("Generating blocks");
     // just generate to a random regtest address. we don't actually need the coins!
@@ -88,6 +88,7 @@ pub async fn test_file_based_block_parser(setup: PreSetup) -> anyhow::Result<()>
         node_rpc_pass: bitcoind.rpc_pass,
         node_rpc_port: bitcoind.rpc_port,
         node_zmq_sequence_port: bitcoind.zmq_sequence_port,
+        p2p_broadcast_peer_ports: Vec::new(),
         serve_grpc_port: setup.reserved_ports.enforcer_serve_grpc.port(),
         serve_json_rpc_port: setup.reserved_ports.enforcer_serve_json_rpc.port(),
         serve_rpc_port: setup.reserved_ports.enforcer_serve_rpc.port(),

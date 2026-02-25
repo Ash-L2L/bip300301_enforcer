@@ -30,7 +30,7 @@ use bitcoin_jsonrpsee::{
 };
 use either::Either;
 use fallible_iterator::{FallibleIterator as _, IteratorExt as _};
-use futures::{FutureExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -1279,6 +1279,19 @@ impl Wallet {
         Ok(psbt)
     }
 
+    fn p2p_broadcast_addrs(&self) -> Box<dyn Iterator<Item = std::net::SocketAddr> + '_> {
+        if self.inner.validator.network() == Network::Signet
+            && self.inner.magic.as_ref() == crate::p2p::SIGNET_MAGIC_BYTES
+        {
+            let res = std::iter::once(crate::p2p::SIGNET_MINER_P2P_ADDR.into())
+                .chain(self.inner.config.p2p_broadcast_addr.iter().copied());
+            Box::new(res)
+        } else {
+            let res = self.inner.config.p2p_broadcast_addr.iter().copied();
+            Box::new(res)
+        }
+    }
+
     /// Creates a deposit transaction, persists it to the database, and returns the TXID.
     /// This is also known as a M5 message, in BIP300 nomenclature.
     ///
@@ -1336,17 +1349,20 @@ impl Wallet {
                 .await
                 .map_err(error::CreateDeposit::BroadcastTx)?
                 .is_some();
-        if self.inner.validator.network() == Network::Signet
-            && self.inner.magic.as_ref() == crate::p2p::SIGNET_MAGIC_BYTES
-        {
-            broadcast_successfully |= crate::p2p::broadcast_nonstandard_tx(
-                crate::p2p::SIGNET_MINER_P2P_ADDR.into(),
-                block_height as i32,
-                self.inner.magic,
-                tx,
-            )
-            .await
-            .map_err(error::CreateDeposit::BroadcastNonstandardTx)?;
+        let mut broadcast_results_stream = self
+            .p2p_broadcast_addrs()
+            .map(|peer_addr| {
+                crate::p2p::broadcast_nonstandard_tx(
+                    peer_addr,
+                    block_height as i32,
+                    self.inner.magic,
+                    tx.clone(),
+                )
+                .map_err(error::CreateDeposit::BroadcastNonstandardTx)
+            })
+            .collect::<futures::stream::FuturesUnordered<_>>();
+        while let Some(broadcast_success) = broadcast_results_stream.try_next().await? {
+            broadcast_successfully |= broadcast_success
         }
         if broadcast_successfully {
             tracing::info!(%txid, "Broadcast deposit transaction successfully");
